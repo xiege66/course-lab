@@ -1,0 +1,275 @@
+--- a/include/utils/spmat_filter_store.h
++++ b/include/utils/spmat_filter_store.h
+@@ -57,6 +57,15 @@
+     in.close();
+ 
+     // Build CSR: flatten into indptr_ (int64) and labels_ (uint32)
++    label_counts_.assign(ncol, 0);
++    for (int64_t i = 0; i < nrow; ++i) {
++      std::vector<int32_t> row;
++      for (int64_t j = indptr[i]; j < indptr[i + 1]; ++j)
++        if (data[j] != 0 && indices[j] >= 0 && indices[j] < ncol) row.push_back(indices[j]);
++      std::sort(row.begin(), row.end());
++      row.erase(std::unique(row.begin(), row.end()), row.end());
++      for (auto label : row) ++label_counts_[label];
++    }
+     n_nodes_ = (uint32_t)nrow;
+     indptr_.resize(nrow + 1);
+ 
+@@ -135,10 +144,23 @@
+     return qi == q_count;
+   }
+ 
++  // Exact for a single tag; min marginal is an upper bound for a conjunction.
++  // This is a budget hint, never a filter predicate or a recall guarantee.
++  double estimate_selectivity(const void *filter_data) const {
++    if (!filter_data || !n_nodes_) return 1.0;
++    const auto *q = static_cast<const uint32_t *>(filter_data);
++    double s = 1.0;
++    for (uint32_t j = 1; j <= q[0]; ++j) {
++      if (q[j] >= label_counts_.size()) return 0.0;
++      s = std::min(s, double(label_counts_[q[j]]) / n_nodes_);
++    }
++    return s;
++  }
+   bool loaded() const { return n_nodes_ > 0; }
+   size_t size() const { return n_nodes_; }
+ 
+  private:
++  std::vector<uint32_t> label_counts_;
+   uint32_t n_nodes_ = 0;
+   int64_t total_labels_ = 0;
+   std::vector<int64_t> indptr_;     // n_nodes+1 entries
+--- a/src/search/pipe_search.cpp
++++ b/src/search/pipe_search.cpp
+@@ -1,4 +1,7 @@
+ #include "aligned_file_reader.h"
++#include "utils/adaptive_filter_policy.h"
++#include <memory>
++#include <queue>
+ #include "utils/libcuckoo/cuckoohash_map.hh"
+ #include "ssd_index.h"
+ #include <malloc.h>
+@@ -78,7 +81,19 @@
+ 
+     Timer query_timer;
+ 
+-    const unsigned effective_lsearch = l_search;
++    static const fvs_opt::Config opt_config = fvs_opt::Config::environment();
++    const bool optimize = opt_config.mode != fvs_opt::Mode::off && this->filter_precheck_ &&
++        filter_data && this->spmat_filter_ && this->spmat_filter_->loaded();
++    const bool adaptive = optimize && opt_config.mode == fvs_opt::Mode::adaptive;
++    const double opt_selectivity = optimize ? this->spmat_filter_->estimate_selectivity(filter_data) : 1.0;
++    std::unique_ptr<fvs_opt::Budget> budget;
++    if (optimize) budget.reset(new fvs_opt::Budget(opt_config, opt_selectivity, k_search));
++    // Adaptive mode retains a max-L pool from the start: growth cannot recover
++    // candidates discarded by a smaller pool. Exploration itself has a hard cap.
++    const unsigned effective_lsearch = !optimize ? l_search :
++        (adaptive ? opt_config.max_l : budget->limit);
++    bool opt_stop = false;
++    std::priority_queue<float> exact_topk;
+     std::vector<Neighbor> retset(mem_L + this->params.R + effective_lsearch * 10);
+     auto &visited = *(query_buf->visited);
+     unsigned cur_list_size = 0;
+@@ -98,6 +113,10 @@
+       // Only add to full_retset if no filter or filter condition is satisfied.
+       if (selector == nullptr || selector->is_member(id, filter_data, node.labels)) {
+         full_retset.push_back(Neighbor(id, cur_expanded_dist, true));
++        if (adaptive) {
++          exact_topk.push(cur_expanded_dist);
++          if (exact_topk.size() > k_search) exact_topk.pop();
++        }
+       }
+       return cur_expanded_dist;
+     };
+@@ -279,6 +298,18 @@
+       return std::make_pair(n_in, n_out);
+     };
+ 
++    auto should_stop = [&](float frontier_pq) {
++      if (!adaptive) return false;
++      bool pending = !on_flight_ios.empty();
++      if (!pending && full_retset.size() >= opt_config.target) {
++        for (unsigned i = 0; i < cur_list_size; ++i)
++          if (!retset[i].visited && id_buf_map.count(retset[i].id)) { pending = true; break; }
++      }
++      const double kth = exact_topk.size() == k_search ? exact_topk.top() :
++          std::numeric_limits<double>::infinity();
++      opt_stop = budget->stop(full_retset.size(), frontier_pq, kth, pending);
++      return opt_stop;
++    };
+     auto send_best_read_req = [&](uint32_t n) -> bool {
+       // auto io_st = std::chrono::high_resolution_clock::now();
+       unsigned n_sent = 0, marker = 0;
+@@ -293,6 +324,7 @@
+           break;  // nothing to send.
+         }
+ 
++        if (should_stop(retset[marker].distance)) break;
+         // =====================================================================
+         // GateANN: Filter-Aware IO — pre-check before any IO or cache
+         // =====================================================================
+@@ -307,7 +339,9 @@
+         if (this->filter_precheck_ && filter_data != nullptr &&
+             ((this->filter_store_ && this->filter_store_->loaded()) ||
+              (this->spmat_filter_ && this->spmat_filter_->loaded()))) {
+-          if (!this->check_filter(retset[marker].id, filter_data)) {
++          const bool opt_pass = this->check_filter(retset[marker].id, filter_data);
++          if (adaptive) budget->observe(opt_pass);
++          if (!opt_pass) {
+             auto bd_tunnel_st = std::chrono::high_resolution_clock::now();
+             retset[marker].flag    = false;
+             retset[marker].visited = true;
+@@ -316,6 +350,36 @@
+               uint32_t nnbrs;
+               const uint32_t *nbrs;
+               this->tunneling_get_adj(retset[marker].id, nnbrs, nbrs);
++              if (adaptive && opt_config.tunnel_keep < nnbrs) {
++                // Rank unvisited neighbors by exact filter pass, then PQ distance.
++                // Rejected neighbors stay unvisited so other graph routes may recover them.
++                std::vector<uint32_t> ids;
++                for (uint32_t m = 0; m < nnbrs; ++m)
++                  if (visited.find(nbrs[m]) == visited.end()) ids.push_back(nbrs[m]);
++                struct Ranked { uint32_t id; float d; bool pass; };
++                std::vector<Ranked> ranked;
++                // Bound scratch writes even when a custom FullAdj has a larger degree.
++                for (size_t off = 0; off < ids.size(); off += MAX_N_EDGES) {
++                  unsigned count = std::min<size_t>(MAX_N_EDGES, ids.size() - off);
++                  nbr_handler->compute_dists(query_buf, ids.data() + off, count);
++                  for (unsigned m = 0; m < count; ++m)
++                    ranked.push_back({ids[off + m], dist_scratch[m], this->check_filter(ids[off + m], filter_data)});
++                }
++                std::sort(ranked.begin(), ranked.end(), [](const Ranked &a, const Ranked &b) {
++                  if (a.pass != b.pass) return a.pass > b.pass;
++                  if (a.d != b.d) return a.d < b.d;
++                  return a.id < b.id;
++                });
++                if (stats) stats->opt_pruned += ranked.size() - std::min<size_t>(ranked.size(), opt_config.tunnel_keep);
++                ranked.resize(std::min<size_t>(ranked.size(), opt_config.tunnel_keep));
++                for (const auto &candidate : ranked) {
++                  visited.insert(candidate.id);
++                  if (cur_list_size == effective_lsearch && candidate.d >= retset[cur_list_size - 1].distance) continue;
++                  auto r = InsertIntoPool(retset.data(), cur_list_size, Neighbor(candidate.id, candidate.d, true));
++                  if (cur_list_size < effective_lsearch) ++cur_list_size;
++                  if (r < marker) marker = r;
++                }
++              } else {
+               uint32_t temp_nbrs[MAX_N_EDGES];
+               unsigned cnt = 0;
+               for (unsigned m = 0; m < nnbrs; m++) {
+@@ -336,6 +400,7 @@
+                     if (r < marker) marker = r;  // rescan if inserted before marker
+                   }
+                 }
++              }
+               }
+             }
+             if (stats != nullptr) {
+@@ -465,7 +530,7 @@
+ #endif
+ 
+     int cur_n_in = 0, cur_tot = 0;
+-    while (get_first_unvisited() != -1) {
++    while (!opt_stop && get_first_unvisited() != -1) {
+       // poll to heap (best-effort) -> calc best from heap (skip if heap is empty) -> send IO (if can send) -> ...
+       // auto io1_st = std::chrono::high_resolution_clock::now();
+       auto [n_in, n_out] = poll_all();
+@@ -505,7 +570,7 @@
+     }
+ 
+     // In relaxed_monotonicity mode: drain all on-flight IOs and process remaining nodes
+-    if (relaxed_monotonicity_l > 0) {
++    if (relaxed_monotonicity_l > 0 || adaptive) {
+       while (!on_flight_ios.empty()) {
+         reader->poll_all(ctx);
+         while (!on_flight_ios.empty() && on_flight_ios.front().finished()) {
+@@ -551,6 +616,15 @@
+       t++;
+     }
+ 
++    if (optimize && stats) {
++      stats->opt_initial = opt_config.initial(opt_selectivity, k_search);
++      stats->opt_final = budget->limit;
++      stats->opt_expanded = budget->expanded;
++      stats->opt_valid = full_retset.size();
++      stats->opt_growths = budget->growths;
++      stats->opt_early = budget->early;
++      stats->opt_capped = budget->capped;
++    }
+     push_query_buf(query_buf);
+ 
+     if (stats != nullptr) {
+--- a/include/utils/percentile_stats.h
++++ b/include/utils/percentile_stats.h
+@@ -6,6 +6,15 @@
+ 
+ namespace pipeann {
+   struct QueryStats {
++    double opt_initial = 0;
++    double opt_final = 0;
++    double opt_expanded = 0;
++    double opt_valid = 0;
++    double opt_growths = 0;
++    double opt_early = 0;
++    double opt_capped = 0;
++    double opt_pruned = 0;
++
+     double total_us = 0;        // total time to process query in micros
+     double n_4k = 0;            // # of 4kB reads
+     double n_8k = 0;            // # of 8kB reads
+--- a/tests/search_disk_index_yfcc.cpp
++++ b/tests/search_disk_index_yfcc.cpp
+@@ -16,6 +16,7 @@
+ // =============================================================================
+ 
+ #include <omp.h>
++#include "utils/adaptive_filter_policy.h"
+ #include <iomanip>
+ #include <fstream>
+ #include <string>
+@@ -129,6 +130,8 @@
+ 
+ template<typename T>
+ int run(int argc, char **argv) {
++  // Fail before entering OpenMP, rather than throwing from a worker.
++  const auto opt_cfg = fvs_opt::Config::environment();
+   int idx = 2;
+   std::string index_prefix(argv[idx++]);
+   uint32_t num_threads = std::atoi(argv[idx++]);
+@@ -157,6 +160,8 @@
+   }
+   if (Lvec.empty()) { std::cerr << "No valid L values\n"; return -1; }
+ 
++  if (opt_cfg.mode != fvs_opt::Mode::off && recall_at > opt_cfg.max_l)
++    throw std::invalid_argument("K exceeds FVS_OPT_MAX_L");
+   // Load data
+   T *query = nullptr;
+   size_t query_num, query_dim;
+@@ -217,7 +222,7 @@
+ 
+   // Result buffers
+   std::vector<std::vector<uint32_t>> results(
+-      Lvec.size(), std::vector<uint32_t>(query_num * recall_at, 0));
++      Lvec.size(), std::vector<uint32_t>(query_num * recall_at, UINT32_MAX));
+   std::vector<pipeann::QueryStats> stats(query_num);
+ 
+   bool is_fa = (search_mode == FILTER_AWARE_PIPE_SEARCH);
+@@ -288,6 +293,18 @@
+               << std::setw(12) << std::fixed << std::setprecision(0) << mean_bd_tunnel
+               << std::setw(12) << std::fixed << std::setprecision(0) << mean_bd_process
+               << std::endl;
++    if (opt_cfg.mode != fvs_opt::Mode::off) {
++      std::cout << "FVS_OPT L=" << L;
++      std::cout << " initial=" << pipeann::get_mean_stats(stats.data(), query_num, [](const pipeann::QueryStats &s) { return s.opt_initial; });
++      std::cout << " final=" << pipeann::get_mean_stats(stats.data(), query_num, [](const pipeann::QueryStats &s) { return s.opt_final; });
++      std::cout << " expanded=" << pipeann::get_mean_stats(stats.data(), query_num, [](const pipeann::QueryStats &s) { return s.opt_expanded; });
++      std::cout << " valid=" << pipeann::get_mean_stats(stats.data(), query_num, [](const pipeann::QueryStats &s) { return s.opt_valid; });
++      std::cout << " growths=" << pipeann::get_mean_stats(stats.data(), query_num, [](const pipeann::QueryStats &s) { return s.opt_growths; });
++      std::cout << " early=" << pipeann::get_mean_stats(stats.data(), query_num, [](const pipeann::QueryStats &s) { return s.opt_early; });
++      std::cout << " capped=" << pipeann::get_mean_stats(stats.data(), query_num, [](const pipeann::QueryStats &s) { return s.opt_capped; });
++      std::cout << " pruned=" << pipeann::get_mean_stats(stats.data(), query_num, [](const pipeann::QueryStats &s) { return s.opt_pruned; });
++      std::cout << std::endl;
++    }
+   }
+ 
+   delete[] query;
